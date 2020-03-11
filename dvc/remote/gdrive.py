@@ -42,7 +42,7 @@ def gdrive_retry(func, retries=15):
     def should_retry(exc):
         from pydrive2.files import ApiRequestError
 
-        return isinstance(exec, ApiRequestError) and (
+        return isinstance(exc, ApiRequestError) and (
             403 == exc.resp.status
             or 500 == exc.resp.status
             or 502 == exc.resp.status
