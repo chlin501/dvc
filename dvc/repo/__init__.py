@@ -1,12 +1,11 @@
 import os
 from contextlib import contextmanager
 from functools import wraps
-from itertools import chain
 
 from dvc.ignore import CleanTree
 from dvc.compat import fspath_py35
 
-from funcy import cached_property, cat
+from funcy import cached_property, cat, first
 
 from dvc.config import Config
 from dvc.exceptions import (
@@ -180,27 +179,33 @@ class Repo(object):
         import networkx as nx
         from dvc.stage import Stage
 
-        G = graph or self.graph
-
         if not target:
-            return list(G)
+            return list(graph) if graph else self.stages
 
         target = os.path.abspath(target)
 
         if recursive and os.path.isdir(target):
-            stages = nx.dfs_postorder_nodes(G)
+            stages = nx.dfs_postorder_nodes(graph or self.graph)
             return [stage for stage in stages if path_isin(stage.path, target)]
 
         stage = Stage.load(self, target)
+
+        # Optimization: do not collect the graph for a specific target
         if not with_deps:
             return [stage]
 
-        pipeline = get_pipeline(get_pipelines(G), stage)
+        pipeline = get_pipeline(get_pipelines(graph or self.graph), stage)
         return list(nx.dfs_postorder_nodes(pipeline, stage))
 
     def collect_granular(self, target, *args, **kwargs):
+        from dvc.stage import Stage
+
         if not target:
             return [(stage, None) for stage in self.stages]
+
+        # Optimization: do not collect the graph for a specific .dvc target
+        if Stage.is_valid_filename(target) and not kwargs.get("with_deps"):
+            return [(Stage.load(self, target), None)]
 
         try:
             (out,) = self.find_outs_by_path(target, strict=False)
@@ -229,7 +234,7 @@ class Repo(object):
         (namely, a file described as an output on a stage).
 
         The scope is, by default, the working directory, but you can use
-        `all_branches` or `all_tags` to expand scope.
+        `all_branches`/`all_tags`/`all_commits` to expand the scope.
 
         Returns:
             A dictionary with Schemes (representing output's location) as keys,
@@ -305,6 +310,7 @@ class Repo(object):
             CyclicGraphError: resulting graph has cycles
         """
         import networkx as nx
+        from pygtrie import Trie
         from dvc.exceptions import (
             OutputDuplicationError,
             StagePathAsOutputError,
@@ -314,48 +320,57 @@ class Repo(object):
         G = nx.DiGraph()
         stages = stages or self.stages
         stages = [stage for stage in stages if stage]
-        outs = {}
+        outs = Trie()  # Use trie to efficiently find overlapping outs and deps
 
         for stage in stages:
             for out in stage.outs:
-                if out.path_info in outs:
-                    dup_stages = [stage, outs[out.path_info].stage]
+                out_key = out.path_info.parts
+
+                # Check for dup outs
+                if out_key in outs:
+                    dup_stages = [stage, outs[out_key].stage]
                     raise OutputDuplicationError(str(out), dup_stages)
-                outs[out.path_info] = out
+
+                # Check for overlapping outs
+                if outs.has_subtrie(out_key):
+                    parent = out
+                    overlapping = first(outs.values(prefix=out_key))
+                else:
+                    parent = outs.shortest_prefix(out_key).value
+                    overlapping = out
+                if parent and overlapping:
+                    msg = (
+                        "Paths for outs:\n'{}'('{}')\n'{}'('{}')\n"
+                        "overlap. To avoid unpredictable behaviour, "
+                        "rerun command with non overlapping outs paths."
+                    ).format(
+                        str(parent),
+                        parent.stage.relpath,
+                        str(overlapping),
+                        overlapping.stage.relpath,
+                    )
+                    raise OverlappingOutputPathsError(parent, overlapping, msg)
+
+                outs[out_key] = out
 
         for stage in stages:
-            for out in stage.outs:
-                for p in out.path_info.parents:
-                    if p in outs:
-                        msg = (
-                            "Paths for outs:\n'{}'('{}')\n'{}'('{}')\n"
-                            "overlap. To avoid unpredictable behaviour, "
-                            "rerun command with non overlapping outs paths."
-                        ).format(
-                            str(outs[p]),
-                            outs[p].stage.relpath,
-                            str(out),
-                            out.stage.relpath,
-                        )
-                        raise OverlappingOutputPathsError(outs[p], out, msg)
+            out = outs.shortest_prefix(PathInfo(stage.path).parts).value
+            if out:
+                raise StagePathAsOutputError(stage, str(out))
 
+        # Building graph
+        G.add_nodes_from(stages)
         for stage in stages:
-            stage_path_info = PathInfo(stage.path)
-            for p in chain([stage_path_info], stage_path_info.parents):
-                if p in outs:
-                    raise StagePathAsOutputError(stage, str(outs[p]))
-
-        for stage in stages:
-            G.add_node(stage)
-
             for dep in stage.deps:
                 if dep.path_info is None:
                     continue
 
-                for out_path_info, out in outs.items():
-                    if out_path_info.overlaps(dep.path_info):
-                        G.add_node(out.stage)
-                        G.add_edge(stage, out.stage)
+                dep_key = dep.path_info.parts
+                overlapping = list(n.value for n in outs.prefixes(dep_key))
+                if outs.has_subtrie(dep_key):
+                    overlapping.extend(outs.values(prefix=dep_key))
+
+                G.add_edges_from((stage, out.stage) for out in overlapping)
 
         check_acyclic(G)
 
