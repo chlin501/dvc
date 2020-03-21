@@ -15,6 +15,7 @@ from dvc.path_info import CloudURLInfo
 from dvc.remote.base import RemoteBASE
 from dvc.exceptions import DvcException
 from dvc.utils import tmp_fname, format_link
+from googleapiclient.errors import HttpError
 
 logger = logging.getLogger(__name__)
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
@@ -42,13 +43,18 @@ def gdrive_retry(func, retries=15):
     def should_retry(exc):
         from pydrive2.files import ApiRequestError
 
-        return isinstance(exc, ApiRequestError) and (
-            403 == exc.resp.status
-            or 500 == exc.resp.status
-            or 502 == exc.resp.status
-            or 503 == exc.resp.status
-            or 504 == exc.resp.status
-        )
+        if isinstance(exc, ApiRequestError):
+            if isinstance(exc.exception(), HttpError):
+                status = exc.exception().resp.status
+                return (
+                    403 == status
+                    or 500 == status
+                    or 502 == status
+                    or 503 == status
+                    or 504 == status
+                )
+        else:
+            return False
 
     # 15 tries, start at 0.5s, multiply by golden ratio, cap at 20s
     return retry(
